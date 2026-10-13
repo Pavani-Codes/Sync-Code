@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import Editor, { type OnMount, type BeforeMount } from '@monaco-editor/react';
 import { io, Socket } from 'socket.io-client';
 import * as Y from 'yjs';
-import { MonacoBinding } from 'y-monaco';
+import { MonacoBinding } from '../utils/y-monaco';
 import { Awareness } from 'y-protocols/awareness';
 import {
   CodeXml,
