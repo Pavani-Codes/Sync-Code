@@ -64,7 +64,6 @@ const LANGUAGE_BOILERPLATES: Record<string, string> = {
   cpp: `// C++ Starter Template\n#include <iostream>\n\nint main() {\n    std::cout << "Hello from SyncCode in C++!" << std::endl;\n    return 0;\n}\n`,
 };
 
-// Strict language detector for Python, Java, and C++
 const inferLanguage = (fileName: string, explicitLang?: string): string => {
   if (explicitLang && ['python', 'java', 'cpp'].includes(explicitLang.toLowerCase())) {
     return explicitLang.toLowerCase();
@@ -233,7 +232,6 @@ export const EditorRoom: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
 
-  // Robust Username Generation / Retrieval
   const [username] = useState(() => {
     try {
       const user = JSON.parse(localStorage.getItem('user') || '{}');
@@ -289,6 +287,9 @@ export const EditorRoom: React.FC = () => {
   const [newMessage, setNewMessage] = useState('');
   const [unreadCount, setUnreadCount] = useState(0);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+
+  // Synchronization Lock Flag to prevent echo cursor jump
+  const isRemoteUpdate = useRef(false);
 
   // References
   const socketRef = useRef<Socket | null>(null);
@@ -463,10 +464,38 @@ export const EditorRoom: React.FC = () => {
       });
     });
 
+    // Cursor-preserving remote edit update
     socket.on('file-code-update', ({ fileId, content }: { fileId: string; content: string }) => {
       setNodes((prev) =>
         prev.map((n) => (n.id === fileId ? { ...n, content } : n))
       );
+
+      if (fileId === activeFileIdRef.current && editorRef.current) {
+        const editor = editorRef.current;
+        const model = editor.getModel();
+
+        if (model && model.getValue() !== content) {
+          isRemoteUpdate.current = true;
+          const currentPosition = editor.getPosition();
+
+          editor.executeEdits('remote-sync', [
+            {
+              range: model.getFullModelRange(),
+              text: content,
+              forceMoveMarkers: true,
+            },
+          ]);
+
+          editor.pushUndoStop();
+
+          if (currentPosition) {
+            editor.setPosition(currentPosition);
+          }
+
+          isRemoteUpdate.current = false;
+        }
+      }
+
       setTimeout(() => renderAllOverlayCursors(), 0);
     });
 
@@ -567,7 +596,7 @@ export const EditorRoom: React.FC = () => {
   };
 
   const handleCodeChange = (value: string | undefined) => {
-    if (isEditorLocked) return;
+    if (isEditorLocked || isRemoteUpdate.current) return;
 
     const updatedContent = value || '';
 
