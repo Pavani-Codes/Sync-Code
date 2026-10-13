@@ -2,6 +2,9 @@ import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Editor, { type OnMount, type BeforeMount } from '@monaco-editor/react';
 import { io, Socket } from 'socket.io-client';
+import * as Y from 'yjs';
+import { MonacoBinding } from 'y-monaco';
+import { Awareness } from 'y-protocols/awareness';
 import {
   CodeXml,
   LogOut,
@@ -197,7 +200,7 @@ const handleEditorWillMount: BeforeMount = (monaco) => {
     ],
     colors: {
       'editor.background': '#f7f5fd',
-      'editor.foreground': '#2b2538',
+      'editor.foreground': '#2d2825',
       'editorCursor.foreground': '#8b5cf6',
       'editor.lineHighlightBackground': '#ece5f9',
       'editorLineNumber.foreground': '#bfaeeb',
@@ -232,7 +235,6 @@ export const EditorRoom: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
 
-  // Unique session identifier to prevent user collapse
   const [username] = useState(() => {
     try {
       const user = JSON.parse(localStorage.getItem('user') || '{}');
@@ -292,13 +294,18 @@ export const EditorRoom: React.FC = () => {
   const [unreadCount, setUnreadCount] = useState(0);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
 
-  // Lock flag for remote deltas
-  const isRemoteUpdate = useRef(false);
-
   // References
   const socketRef = useRef<Socket | null>(null);
   const editorRef = useRef<any>(null);
-  const monacoRef = useRef<any>(null);
+
+  // Yjs CRDT References
+  const yDocsRef = useRef<Map<string, Y.Doc>>(new Map());
+  const yAwarenessRef = useRef<Map<string, Awareness>>(new Map());
+  const yBindingRef = useRef<MonacoBinding | null>(null);
+  const boundFileIdRef = useRef<string | null>(null);
+  const [syncedFileIds, setSyncedFileIds] = useState<Set<string>>(new Set());
+  const [editorMountVersion, setEditorMountVersion] = useState(0);
+
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const remoteCursorPositions = useRef<Map<string, RemoteCursorData>>(new Map());
@@ -309,6 +316,28 @@ export const EditorRoom: React.FC = () => {
     activeFileIdRef.current = activeFileId;
   }, [activeFileId]);
 
+  const getYDoc = useCallback((fileId: string): Y.Doc => {
+    let doc = yDocsRef.current.get(fileId);
+    if (!doc) {
+      doc = new Y.Doc();
+      yDocsRef.current.set(fileId, doc);
+      yAwarenessRef.current.set(fileId, new Awareness(doc));
+
+      doc.on('update', (update: Uint8Array, origin: unknown) => {
+        if (origin === 'remote-socket') return;
+        const socket = socketRef.current;
+        if (socket?.connected && roomId) {
+          socket.emit('yjs-update', {
+            roomId,
+            fileId,
+            update: Array.from(update),
+          });
+        }
+      });
+    }
+    return doc;
+  }, [roomId]);
+
   const isHost = roomPermissions.hostSocketId === socketRef.current?.id;
   const activeFile = nodes.find((n) => n.id === activeFileId && n.type === 'file');
   const isEditorLocked = !isHost && (roomPermissions.isReadOnly || activeFile?.isLocked);
@@ -316,25 +345,33 @@ export const EditorRoom: React.FC = () => {
   const handleLanguageChange = (newLang: string) => {
     if (!activeFileId || !activeFile) return;
 
-    const hasOnlyComment =
-      !activeFile.content ||
-      activeFile.content.trim().startsWith('//') ||
-      activeFile.content.trim().startsWith('#') ||
-      activeFile.content.includes('<!DOCTYPE html>') ||
-      activeFile.content.includes('<html>');
+    const doc = getYDoc(activeFileId);
+    const ytext = doc.getText('content');
+    const currentVal = ytext.toString();
 
-    const newContent = hasOnlyComment
-      ? (LANGUAGE_BOILERPLATES[newLang] || '')
-      : activeFile.content;
+    const hasOnlyComment =
+      !currentVal ||
+      currentVal.trim().startsWith('//') ||
+      currentVal.trim().startsWith('#') ||
+      currentVal.includes('<!DOCTYPE html>') ||
+      currentVal.includes('<html>');
+
+    if (hasOnlyComment) {
+      const template = LANGUAGE_BOILERPLATES[newLang] || '';
+      doc.transact(() => {
+        ytext.delete(0, ytext.length);
+        ytext.insert(0, template);
+      });
+    }
 
     setNodes((prev) =>
-      prev.map((n) => (n.id === activeFileId ? { ...n, language: newLang, content: newContent } : n))
+      prev.map((n) => (n.id === activeFileId ? { ...n, language: newLang } : n))
     );
 
     socketRef.current?.emit('file-code-change', {
       roomId,
       fileId: activeFileId,
-      content: newContent,
+      content: ytext.toString(),
       language: newLang,
     });
   };
@@ -400,6 +437,50 @@ export const EditorRoom: React.FC = () => {
     renderAllOverlayCursors();
   }, [activeFileId, renderAllOverlayCursors]);
 
+  // Request authoritative Yjs sync when active file changes
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket?.connected || !roomId || !activeFileId) return;
+    const file = nodes.find((node) => node.id === activeFileId && node.type === 'file');
+    if (!file) return;
+
+    socket.emit('yjs-sync-request', {
+      roomId,
+      fileId: activeFileId,
+      initialContent: file.content ?? '',
+    });
+  }, [activeFileId, roomId, nodes.length]);
+
+  // Bind Monaco to Yjs once the file state is synced
+  useEffect(() => {
+    const editor = editorRef.current;
+    const fileId = activeFileId;
+    if (!editor || !fileId || !syncedFileIds.has(fileId)) return;
+
+    const model = editor.getModel();
+    const doc = getYDoc(fileId);
+    const awareness = yAwarenessRef.current.get(fileId);
+    if (!model || !awareness) return;
+
+    if (boundFileIdRef.current === fileId && yBindingRef.current) return;
+
+    yBindingRef.current?.destroy();
+    yBindingRef.current = null;
+    boundFileIdRef.current = null;
+
+    const binding = new MonacoBinding(doc.getText('content'), model, new Set([editor]), awareness);
+    yBindingRef.current = binding;
+    boundFileIdRef.current = fileId;
+
+    return () => {
+      if (boundFileIdRef.current === fileId) {
+        yBindingRef.current?.destroy();
+        yBindingRef.current = null;
+        boundFileIdRef.current = null;
+      }
+    };
+  }, [activeFileId, syncedFileIds, editorMountVersion, getYDoc]);
+
   // SOCKET INITIALIZATION
   useEffect(() => {
     const BACKEND_URL =
@@ -437,11 +518,14 @@ export const EditorRoom: React.FC = () => {
     socket.on('files-update', (projectNodes: FileTreeNode[]) => {
       const normalizedNodes = projectNodes.map((n) => {
         if (n.type === 'file') {
+          const hasHtmlContent =
+            !!n.content &&
+            (n.content.includes('<!DOCTYPE html>') || n.content.includes('<html>'));
           const isLegacyHtml =
             n.name.toLowerCase().endsWith('.html') ||
             n.name.toLowerCase().endsWith('.htm') ||
             n.name.toLowerCase() === 'index.html' ||
-            (n.content && (n.content.includes('<!DOCTYPE html>') || n.content.includes('<html>')));
+            hasHtmlContent;
 
           const finalName = isLegacyHtml ? 'main.py' : n.name;
           const resolvedLang = isLegacyHtml ? 'python' : inferLanguage(finalName, n.language);
@@ -450,7 +534,10 @@ export const EditorRoom: React.FC = () => {
             ...n,
             name: finalName,
             language: resolvedLang,
-            content: isLegacyHtml || !n.content ? LANGUAGE_BOILERPLATES[resolvedLang] : n.content,
+            content:
+              hasHtmlContent || !n.content
+                ? LANGUAGE_BOILERPLATES[resolvedLang] || ''
+                : n.content,
           };
         }
         return n;
@@ -468,47 +555,22 @@ export const EditorRoom: React.FC = () => {
       });
     });
 
-    // Handle Incremental Line/Delta Sync (Prevents Overwriting Remote Edits)
-    socket.on('file-code-delta', ({ fileId, range, text }: {
-      fileId: string;
-      range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
-      text: string;
-    }) => {
-      if (fileId === activeFileIdRef.current && editorRef.current && monacoRef.current) {
-        const editor = editorRef.current;
-        const model = editor.getModel();
+    // Authoritative state vector returned from server
+    socket.on('yjs-sync-state', ({ fileId, update }: { fileId: string; update: number[] }) => {
+      const doc = getYDoc(fileId);
+      Y.applyUpdate(doc, new Uint8Array(update), 'remote-socket');
 
-        if (model) {
-          isRemoteUpdate.current = true;
-
-          editor.executeEdits('remote-delta', [
-            {
-              range: new monacoRef.current.Range(
-                range.startLineNumber,
-                range.startColumn,
-                range.endLineNumber,
-                range.endColumn
-              ),
-              text: text,
-              forceMoveMarkers: true,
-            },
-          ]);
-
-          const updatedDoc = model.getValue();
-          setNodes((prev) =>
-            prev.map((n) => (n.id === fileId ? { ...n, content: updatedDoc } : n))
-          );
-
-          isRemoteUpdate.current = false;
-        }
-      }
+      setSyncedFileIds((prev) => {
+        const next = new Set(prev);
+        next.add(fileId);
+        return next;
+      });
     });
 
-    // Fallback full file content update
-    socket.on('file-code-update', ({ fileId, content }: { fileId: string; content: string }) => {
-      setNodes((prev) =>
-        prev.map((n) => (n.id === fileId ? { ...n, content } : n))
-      );
+    // Real-time incremental delta updates
+    socket.on('yjs-update', ({ fileId, update }: { fileId: string; update: number[] }) => {
+      const doc = getYDoc(fileId);
+      Y.applyUpdate(doc, new Uint8Array(update), 'remote-socket');
     });
 
     socket.on('peer:active-file-changed', ({ socketId, fileId }: { socketId: string; fileId: string }) => {
@@ -558,9 +620,16 @@ export const EditorRoom: React.FC = () => {
     });
 
     return () => {
+      yBindingRef.current?.destroy();
+      yBindingRef.current = null;
+      boundFileIdRef.current = null;
+      yAwarenessRef.current.forEach((awareness) => awareness.destroy());
+      yDocsRef.current.forEach((doc) => doc.destroy());
+      yAwarenessRef.current.clear();
+      yDocsRef.current.clear();
       socket.disconnect();
     };
-  }, [roomId, navigate, removeRemoteCursor, renderAllOverlayCursors]);
+  }, [roomId, navigate, removeRemoteCursor, renderAllOverlayCursors, getYDoc]);
 
   useEffect(() => {
     if (isChatOpen) {
@@ -581,37 +650,12 @@ export const EditorRoom: React.FC = () => {
     }
   }, [isChatOpen, messages, roomId]);
 
-  const handleEditorMount: OnMount = (editor, monaco) => {
+  const handleEditorMount: OnMount = (editor) => {
     editorRef.current = editor;
-    monacoRef.current = monaco;
-
-    // Attach granular listener to Monaco model
-    editor.onDidChangeModelContent((event) => {
-      if (isRemoteUpdate.current || isEditorLocked) return;
-
-      event.changes.forEach((change) => {
-        socketRef.current?.emit('file-code-delta', {
-          roomId,
-          fileId: activeFileIdRef.current,
-          range: {
-            startLineNumber: change.range.startLineNumber,
-            startColumn: change.range.startColumn,
-            endLineNumber: change.range.endLineNumber,
-            endColumn: change.range.endColumn,
-          },
-          text: change.text,
-        });
-      });
-
-      const currentDoc = editor.getValue();
-      setNodes((prev) =>
-        prev.map((n) => (n.id === activeFileIdRef.current ? { ...n, content: currentDoc } : n))
-      );
-    });
+    setEditorMountVersion((version) => version + 1);
 
     editor.onDidChangeCursorPosition((e) => {
       if (!editor.hasTextFocus()) return;
-
       socketRef.current?.emit('cursor-change', {
         roomId,
         fileId: activeFileIdRef.current,
@@ -626,7 +670,6 @@ export const EditorRoom: React.FC = () => {
 
     editor.onDidScrollChange(() => renderAllOverlayCursors());
     editor.onDidLayoutChange(() => renderAllOverlayCursors());
-
     window.addEventListener('resize', renderAllOverlayCursors);
   };
 
@@ -638,12 +681,15 @@ export const EditorRoom: React.FC = () => {
     e.preventDefault();
     if (!checkpointName.trim() || !activeFile) return;
 
+    const doc = getYDoc(activeFile.id);
+    const currentCode = doc.getText('content').toString();
+
     const newSnapshot: CodeSnapshot = {
       id: `snap-${Date.now()}`,
       fileId: activeFile.id,
       fileName: activeFile.name,
       name: checkpointName.trim(),
-      content: activeFile.content || '',
+      content: currentCode,
       author: currentUserRef.current.name,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
@@ -727,6 +773,9 @@ export const EditorRoom: React.FC = () => {
     setIsConsoleOpen(true);
     setOutput(`Executing ${activeFile.name}...`);
 
+    const doc = getYDoc(activeFile.id);
+    const codeToRun = doc.getText('content').toString();
+
     const BACKEND_URL =
       import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
 
@@ -734,7 +783,7 @@ export const EditorRoom: React.FC = () => {
       const response = await fetch(`${BACKEND_URL}/api/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ language: activeFile.language, code: activeFile.content }),
+        body: JSON.stringify({ language: activeFile.language, code: codeToRun }),
       });
 
       const data = await response.json();
@@ -1190,7 +1239,7 @@ export const EditorRoom: React.FC = () => {
                 path={activeFile.name}
                 theme={theme.monacoTheme}
                 language={activeFile.language || 'python'}
-                value={activeFile.content}
+                defaultValue={activeFile.content || ''}
                 beforeMount={handleEditorWillMount}
                 onMount={handleEditorMount}
                 options={{
