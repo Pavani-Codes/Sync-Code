@@ -232,13 +232,17 @@ export const EditorRoom: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
 
+  // Unique user identification per browser session/tab
   const [username] = useState(() => {
     try {
       const user = JSON.parse(localStorage.getItem('user') || '{}');
-      if (user.name) return user.name;
-      if (user.username) return user.username;
+      const baseName = user.name || user.username;
+      if (baseName) {
+        const sessionSuffix = Math.floor(100 + Math.random() * 900);
+        return `${baseName}_${sessionSuffix}`;
+      }
     } catch {}
-    return `Developer_${Math.floor(Math.random() * 900) + 100}`;
+    return `Developer_${Math.floor(1000 + Math.random() * 9000)}`;
   });
 
   const currentUserRef = useRef({ name: username });
@@ -288,7 +292,7 @@ export const EditorRoom: React.FC = () => {
   const [unreadCount, setUnreadCount] = useState(0);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
 
-  // Synchronization Lock Flag to prevent echo cursor jump
+  // Synchronization Lock to prevent remote overwrite and cursor collision
   const isRemoteUpdate = useRef(false);
 
   // References
