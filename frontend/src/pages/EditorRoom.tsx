@@ -395,7 +395,7 @@ export const EditorRoom: React.FC = () => {
     renderAllOverlayCursors();
   }, [activeFileId, renderAllOverlayCursors]);
 
-  /// SOCKET CONNECTION & INITIALIZATION
+  // SOCKET CONNECTION & INITIALIZATION
   useEffect(() => {
     const BACKEND_URL =
       import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
@@ -430,7 +430,6 @@ export const EditorRoom: React.FC = () => {
     });
 
     socket.on('files-update', (projectNodes: FileTreeNode[]) => {
-      // OVERRIDE: Automatically convert any index.html / html files sent from the backend into main.py
       const normalizedNodes = projectNodes.map((n) => {
         if (n.type === 'file') {
           const isLegacyHtml =
@@ -454,7 +453,6 @@ export const EditorRoom: React.FC = () => {
 
       setNodes(normalizedNodes);
 
-      // Auto-select first file if none selected
       setActiveFileId((currentActive) => {
         const fileExists = normalizedNodes.some((n) => n.id === currentActive && n.type === 'file');
         if (!fileExists) {
@@ -681,8 +679,11 @@ export const EditorRoom: React.FC = () => {
     setIsConsoleOpen(true);
     setOutput(`Executing ${activeFile.name}...`);
 
+    const BACKEND_URL =
+      import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
+
     try {
-      const response = await fetch('http://localhost:5000/api/execute', {
+      const response = await fetch(`${BACKEND_URL}/api/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ language: activeFile.language, code: activeFile.content }),
@@ -867,7 +868,6 @@ export const EditorRoom: React.FC = () => {
 
         {/* Navbar Controls */}
         <div className="flex items-center gap-3">
-          {/* Host Toggle Read-Only Control */}
           {isHost && (
             <button
               onClick={handleToggleReadOnly}
@@ -882,7 +882,6 @@ export const EditorRoom: React.FC = () => {
             </button>
           )}
 
-          {/* History Drawer Toggle Button */}
           <button
             onClick={toggleHistory}
             className={`flex items-center gap-1.5 border ${theme.border} ${theme.panelBg} ${theme.text} px-3 py-1.5 rounded-xl text-xs font-semibold transition-all hover:scale-105 shadow-sm`}
