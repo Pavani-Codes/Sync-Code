@@ -395,9 +395,14 @@ export const EditorRoom: React.FC = () => {
     renderAllOverlayCursors();
   }, [activeFileId, renderAllOverlayCursors]);
 
-  // SOCKET CONNECTION & INITIALIZATION
+  /// SOCKET CONNECTION & INITIALIZATION
   useEffect(() => {
-    const socket = io('http://localhost:5000');
+    const BACKEND_URL =
+      import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
+
+    const socket = io(BACKEND_URL, {
+      transports: ['websocket', 'polling'],
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => {

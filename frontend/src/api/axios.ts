@@ -1,7 +1,10 @@
 import axios from 'axios';
 
+const BACKEND_URL =
+  import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
+
 const api = axios.create({
-  baseURL: 'http://localhost:5000/api/v1',
+  baseURL: `${BACKEND_URL}/api`,
   headers: {
     'Content-Type': 'application/json',
   },
