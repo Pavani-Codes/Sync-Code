@@ -1,10 +1,9 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import Editor, { type OnMount, type BeforeMount } from '@monaco-editor/react';
 import { io, Socket } from 'socket.io-client';
 import * as Y from 'yjs';
 import { MonacoBinding } from '../utils/y-monaco';
-import { Awareness } from 'y-protocols/awareness';
 import {
   CodeXml,
   LogOut,
@@ -39,6 +38,7 @@ import {
   RotateCcw,
   Eye,
   UserCheck,
+  CornerDownLeft,
 } from 'lucide-react';
 
 export interface FileTreeNode {
@@ -62,9 +62,9 @@ export interface CodeSnapshot {
 }
 
 const LANGUAGE_BOILERPLATES: Record<string, string> = {
-  python: `# Python Starter Template\ndef main():\n    print("Hello from SyncCode in Python!")\n\nif __name__ == "__main__":\n    main()\n`,
-  java: `// Java Starter Template\npublic class Main {\n    public static void main(String[] args) {\n        System.out.println("Hello from SyncCode in Java!");\n    }\n}\n`,
-  cpp: `// C++ Starter Template\n#include <iostream>\n\nint main() {\n    std::cout << "Hello from SyncCode in C++!" << std::endl;\n    return 0;\n}\n`,
+  python: `# Python Starter Template\ndef main():\n    name = input("Enter your name: ")\n    print(f"Hello, {name} from SyncCode!")\n\nif __name__ == "__main__":\n    main()\n`,
+  java: `// Java Starter Template\nimport java.util.Scanner;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner scanner = new Scanner(System.in);\n        System.out.print("Enter your name: ");\n        String name = scanner.nextLine();\n        System.out.println("Hello, " + name + " from SyncCode in Java!");\n    }\n}\n`,
+  cpp: `// C++ Starter Template\n#include <iostream>\n#include <string>\n\nint main() {\n    std::string name;\n    std::cout << "Enter your name: ";\n    std::cin >> name;\n    std::cout << "Hello, " << name << " from SyncCode in C++!" << std::endl;\n    return 0;\n}\n`,
 };
 
 const inferLanguage = (fileName: string, explicitLang?: string): string => {
@@ -200,7 +200,7 @@ const handleEditorWillMount: BeforeMount = (monaco) => {
     ],
     colors: {
       'editor.background': '#f7f5fd',
-      'editor.foreground': '#2d2825',
+      'editor.foreground': '#2b2538',
       'editorCursor.foreground': '#8b5cf6',
       'editor.lineHighlightBackground': '#ece5f9',
       'editorLineNumber.foreground': '#bfaeeb',
@@ -234,6 +234,12 @@ const handleEditorWillMount: BeforeMount = (monaco) => {
 export const EditorRoom: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  // Project Name state
+  const [projectName, setProjectName] = useState<string>(() => {
+    return (location.state as any)?.projectName || '';
+  });
 
   const [username] = useState(() => {
     try {
@@ -284,8 +290,9 @@ export const EditorRoom: React.FC = () => {
   const [copied, setCopied] = useState(false);
   const [activeUsers, setActiveUsers] = useState<RoomUser[]>([]);
 
-  // Execution & Chat
+  // Execution & STDIN Terminal States
   const [output, setOutput] = useState<string>('');
+  const [stdinInput, setStdinInput] = useState<string>('');
   const [isRunning, setIsRunning] = useState(false);
   const [isConsoleOpen, setIsConsoleOpen] = useState(true);
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -300,7 +307,6 @@ export const EditorRoom: React.FC = () => {
 
   // Yjs CRDT References
   const yDocsRef = useRef<Map<string, Y.Doc>>(new Map());
-  const yAwarenessRef = useRef<Map<string, Awareness>>(new Map());
   const yBindingRef = useRef<MonacoBinding | null>(null);
   const boundFileIdRef = useRef<string | null>(null);
   const [syncedFileIds, setSyncedFileIds] = useState<Set<string>>(new Set());
@@ -321,7 +327,6 @@ export const EditorRoom: React.FC = () => {
     if (!doc) {
       doc = new Y.Doc();
       yDocsRef.current.set(fileId, doc);
-      yAwarenessRef.current.set(fileId, new Awareness(doc));
 
       doc.on('update', (update: Uint8Array, origin: unknown) => {
         if (origin === 'remote-socket') return;
@@ -367,13 +372,6 @@ export const EditorRoom: React.FC = () => {
     setNodes((prev) =>
       prev.map((n) => (n.id === activeFileId ? { ...n, language: newLang } : n))
     );
-
-    socketRef.current?.emit('file-code-change', {
-      roomId,
-      fileId: activeFileId,
-      content: ytext.toString(),
-      language: newLang,
-    });
   };
 
   const renderAllOverlayCursors = useCallback(() => {
@@ -437,7 +435,7 @@ export const EditorRoom: React.FC = () => {
     renderAllOverlayCursors();
   }, [activeFileId, renderAllOverlayCursors]);
 
-  // Request authoritative Yjs sync when active file changes
+  // Request Yjs sync for active file
   useEffect(() => {
     const socket = socketRef.current;
     if (!socket?.connected || !roomId || !activeFileId) return;
@@ -451,7 +449,7 @@ export const EditorRoom: React.FC = () => {
     });
   }, [activeFileId, roomId, nodes.length]);
 
-  // Bind Monaco to Yjs once the file state is synced
+  // Bind Monaco to Yjs document
   useEffect(() => {
     const editor = editorRef.current;
     const fileId = activeFileId;
@@ -459,8 +457,7 @@ export const EditorRoom: React.FC = () => {
 
     const model = editor.getModel();
     const doc = getYDoc(fileId);
-    const awareness = yAwarenessRef.current.get(fileId);
-    if (!model || !awareness) return;
+    if (!model) return;
 
     if (boundFileIdRef.current === fileId && yBindingRef.current) return;
 
@@ -468,7 +465,7 @@ export const EditorRoom: React.FC = () => {
     yBindingRef.current = null;
     boundFileIdRef.current = null;
 
-    const binding = new MonacoBinding(doc.getText('content'), model, new Set([editor]), awareness);
+    const binding = new MonacoBinding(doc.getText('content'), model, new Set([editor]));
     yBindingRef.current = binding;
     boundFileIdRef.current = fileId;
 
@@ -481,7 +478,7 @@ export const EditorRoom: React.FC = () => {
     };
   }, [activeFileId, syncedFileIds, editorMountVersion, getYDoc]);
 
-  // SOCKET INITIALIZATION
+  // Socket connection initialization
   useEffect(() => {
     const BACKEND_URL =
       import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
@@ -495,7 +492,12 @@ export const EditorRoom: React.FC = () => {
       socket.emit('join-room', {
         roomId,
         username: currentUserRef.current.name,
+        roomName: projectName,
       });
+    });
+
+    socket.on('room-details', ({ name }: { name: string }) => {
+      if (name) setProjectName(name);
     });
 
     socket.on('active-users-update', (users: RoomUser[]) => {
@@ -555,7 +557,6 @@ export const EditorRoom: React.FC = () => {
       });
     });
 
-    // Authoritative state vector returned from server
     socket.on('yjs-sync-state', ({ fileId, update }: { fileId: string; update: number[] }) => {
       const doc = getYDoc(fileId);
       Y.applyUpdate(doc, new Uint8Array(update), 'remote-socket');
@@ -567,7 +568,6 @@ export const EditorRoom: React.FC = () => {
       });
     });
 
-    // Real-time incremental delta updates
     socket.on('yjs-update', ({ fileId, update }: { fileId: string; update: number[] }) => {
       const doc = getYDoc(fileId);
       Y.applyUpdate(doc, new Uint8Array(update), 'remote-socket');
@@ -623,13 +623,11 @@ export const EditorRoom: React.FC = () => {
       yBindingRef.current?.destroy();
       yBindingRef.current = null;
       boundFileIdRef.current = null;
-      yAwarenessRef.current.forEach((awareness) => awareness.destroy());
       yDocsRef.current.forEach((doc) => doc.destroy());
-      yAwarenessRef.current.clear();
       yDocsRef.current.clear();
       socket.disconnect();
     };
-  }, [roomId, navigate, removeRemoteCursor, renderAllOverlayCursors, getYDoc]);
+  }, [roomId, navigate, removeRemoteCursor, renderAllOverlayCursors, getYDoc, projectName]);
 
   useEffect(() => {
     if (isChatOpen) {
@@ -766,29 +764,48 @@ export const EditorRoom: React.FC = () => {
     }
   };
 
+  // Run code using direct Piston sandbox execution with interactive STDIN input support
   const runCode = async () => {
     if (!activeFile) return;
 
     setIsRunning(true);
     setIsConsoleOpen(true);
-    setOutput(`Executing ${activeFile.name}...`);
+    setOutput(`[SyncCode]: Executing ${activeFile.name} with Piston Engine...\n`);
 
     const doc = getYDoc(activeFile.id);
     const codeToRun = doc.getText('content').toString();
 
-    const BACKEND_URL =
-      import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
+    // Map extension to Piston language specifications
+    const langMap: Record<string, { language: string; version: string; file: string }> = {
+      python: { language: 'python', version: '3.10.0', file: 'main.py' },
+      java: { language: 'java', version: '15.0.2', file: 'Main.java' },
+      cpp: { language: 'c++', version: '10.2.0', file: 'main.cpp' },
+    };
+
+    const currentLang = activeFile.language || 'python';
+    const spec = langMap[currentLang] || langMap.python;
 
     try {
-      const response = await fetch(`${BACKEND_URL}/api/execute`, {
+      const response = await fetch('https://emkc.org/api/v2/piston/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ language: activeFile.language, code: codeToRun }),
+        body: JSON.stringify({
+          language: spec.language,
+          version: spec.version,
+          files: [{ name: spec.file, content: codeToRun }],
+          stdin: stdinInput,
+        }),
       });
 
       const data = await response.json();
-      setOutput(data.output || data.error || 'Execution completed.');
-      socketRef.current?.emit('run-code-results', { roomId, output: data.output });
+      const runResult = data.run;
+      const combinedOutput =
+        (runResult?.output || '') ||
+        (data.compile?.stderr ? `Compile Error:\n${data.compile.stderr}` : '') ||
+        (data.message || 'Execution completed with no output.');
+
+      setOutput(combinedOutput);
+      socketRef.current?.emit('run-code-results', { roomId, output: combinedOutput });
     } catch (err: any) {
       const errorMsg = `Error: Execution failed. ${err.message}`;
       setOutput(errorMsg);
@@ -938,16 +955,24 @@ export const EditorRoom: React.FC = () => {
 
   return (
     <div className={`h-screen flex flex-col ${theme.bg} ${theme.text} transition-colors duration-300 font-sans overflow-hidden select-none`}>
-      {/* Top Navbar */}
+      {/* Top Navbar with Project Name */}
       <nav className={`h-14 border-b ${theme.border} ${theme.panelBg} px-6 flex items-center justify-between shadow-sm relative z-30`}>
         <div className="flex items-center gap-3">
           <div className="p-1.5 rounded-xl bg-indigo-500/10 border border-indigo-500/20">
             <CodeXml className={`h-5 w-5 ${theme.accentText}`} />
           </div>
-          <span className="font-extrabold text-lg tracking-wider">SyncCode</span>
+
+          {/* Displays user's actual project name */}
+          <div className="flex flex-col">
+            <span className="font-extrabold text-sm tracking-wide leading-tight">
+              {projectName || `Project ${roomId}`}
+            </span>
+            <span className="text-[10px] opacity-60 font-mono">SyncCode Studio</span>
+          </div>
+
           <span className="opacity-30">|</span>
 
-          {/* Room Badge */}
+          {/* Room Code Badge */}
           <div className={`flex items-center gap-2 px-3 py-1 rounded-xl text-xs font-mono border ${theme.border} bg-black/5`}>
             <span className={theme.textMuted}>Room:</span>
             <span className={`font-bold ${theme.accentText}`}>{roomId}</span>
@@ -1178,7 +1203,7 @@ export const EditorRoom: React.FC = () => {
               )}
             </div>
 
-            {/* Save Checkpoint Action */}
+            {/* Checkpoint & Font Size Controls */}
             <div className="flex items-center gap-3">
               {activeFile && !isEditorLocked && (
                 <button
@@ -1189,7 +1214,6 @@ export const EditorRoom: React.FC = () => {
                 </button>
               )}
 
-              {/* Font Size Selector */}
               <div className={`flex items-center gap-2 ${theme.textMuted} hover:${theme.text} transition-colors`}>
                 <Settings className="h-3.5 w-3.5" />
                 <select
@@ -1214,7 +1238,7 @@ export const EditorRoom: React.FC = () => {
                 type="text"
                 value={checkpointName}
                 onChange={(e) => setCheckpointName(e.target.value)}
-                placeholder="e.g. Before refactoring function"
+                placeholder="e.g. Before refactoring"
                 autoFocus
                 className={`flex-1 bg-white/50 border ${theme.border} text-xs rounded-lg px-3 py-1 outline-none`}
               />
@@ -1260,15 +1284,15 @@ export const EditorRoom: React.FC = () => {
             )}
           </div>
 
-          {/* Console Window */}
-          <div className={`border-t ${theme.border} ${theme.panelBg} transition-all duration-300 ${isConsoleOpen ? 'h-48' : 'h-9'}`}>
+          {/* Console / Interactive Terminal Window */}
+          <div className={`border-t ${theme.border} ${theme.panelBg} transition-all duration-300 ${isConsoleOpen ? 'h-52' : 'h-9'}`}>
             <div
               onClick={() => setIsConsoleOpen(!isConsoleOpen)}
               className="h-9 px-4 flex items-center justify-between cursor-pointer border-b border-inherit select-none"
             >
               <div className="flex items-center gap-2 text-xs font-semibold">
                 <Terminal className="h-4 w-4 text-emerald-500" />
-                <span>Console Output</span>
+                <span>Console Terminal</span>
               </div>
               <button className="opacity-60 hover:opacity-100">
                 {isConsoleOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
@@ -1276,12 +1300,35 @@ export const EditorRoom: React.FC = () => {
             </div>
 
             {isConsoleOpen && (
-              <div id="chat-panel" className="p-4 h-[calc(100%-2.25rem)] overflow-auto font-mono text-xs opacity-90 leading-relaxed bg-black/5">
-                {output ? (
-                  <pre className="whitespace-pre-wrap">{output}</pre>
-                ) : (
-                  <span className={`${theme.textMuted} italic`}>Click "Run" to execute script and view output here...</span>
-                )}
+              <div className="h-[calc(100%-2.25rem)] flex flex-col bg-black/5 font-mono text-xs">
+                {/* Console Output Area */}
+                <div className="flex-1 p-3 overflow-auto leading-relaxed">
+                  {output ? (
+                    <pre className="whitespace-pre-wrap">{output}</pre>
+                  ) : (
+                    <span className={`${theme.textMuted} italic`}>Click "Run" to compile and execute program output...</span>
+                  )}
+                </div>
+
+                {/* Interactive STDIN input bar */}
+                <div className={`p-2 border-t ${theme.border} bg-black/5 flex items-center gap-2`}>
+                  <span className="text-[11px] font-bold opacity-60">STDIN:</span>
+                  <input
+                    type="text"
+                    value={stdinInput}
+                    onChange={(e) => setStdinInput(e.target.value)}
+                    placeholder="Provide input values for input() / Scanner here..."
+                    className={`flex-1 bg-white/40 dark:bg-black/20 border ${theme.border} text-xs rounded-lg px-2.5 py-1 outline-none font-mono focus:border-indigo-500`}
+                  />
+                  <button
+                    onClick={runCode}
+                    disabled={isRunning || !activeFile}
+                    className={`flex items-center gap-1 ${theme.accentBg} text-white px-2.5 py-1 rounded-lg text-xs font-semibold shadow-sm transition-all hover:scale-105 disabled:opacity-50`}
+                    title="Send Input & Execute"
+                  >
+                    <CornerDownLeft className="h-3 w-3" /> Run
+                  </button>
+                </div>
               </div>
             )}
           </div>
