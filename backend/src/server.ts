@@ -87,10 +87,6 @@ io.on('connection', (socket) => {
 
   const handleJoinRoom = async ({ roomId, username }: { roomId: string; username: string }) => {
     if (!roomId) return;
-    
-    Array.from(socket.rooms).forEach((r) => {
-      if (r !== socket.id) socket.leave(r);
-    });
 
     socket.join(roomId);
 
@@ -138,9 +134,16 @@ io.on('connection', (socket) => {
     }
 
     const userColor = AVATAR_COLORS[roomUsers[roomId].length % AVATAR_COLORS.length];
-    const cleanUsername = username || 'Anonymous';
-    const newUser: RoomUser = { socketId: socket.id, username: cleanUsername, color: userColor, isHost, activeFileId: roomFilesStore[roomId][0]?.id || 'file-1' };
+    const cleanUsername = username || `Dev_${socket.id.slice(0, 4)}`;
+    const newUser: RoomUser = {
+      socketId: socket.id,
+      username: cleanUsername,
+      color: userColor,
+      isHost,
+      activeFileId: roomFilesStore[roomId][0]?.id || 'file-1',
+    };
 
+    // Remove any stale connection for this exact socket ID, then add new user
     roomUsers[roomId] = roomUsers[roomId].filter((u) => u.socketId !== socket.id);
     roomUsers[roomId].push(newUser);
 
@@ -153,6 +156,11 @@ io.on('connection', (socket) => {
 
   socket.on('join-room', handleJoinRoom);
   socket.on('room:join', handleJoinRoom);
+
+  // Granular line/delta code synchronization to prevent text overlaps
+  socket.on('file-code-delta', ({ roomId, fileId, range, text }) => {
+    socket.to(roomId).emit('file-code-delta', { fileId, range, text });
+  });
 
   socket.on('peer:active-file-change', ({ roomId, fileId }) => {
     if (roomUsers[roomId]) {

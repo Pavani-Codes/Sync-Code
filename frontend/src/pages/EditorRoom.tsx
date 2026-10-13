@@ -232,7 +232,7 @@ export const EditorRoom: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
 
-  // Unique user identification per browser session/tab
+  // Unique session identifier to prevent user collapse
   const [username] = useState(() => {
     try {
       const user = JSON.parse(localStorage.getItem('user') || '{}');
@@ -242,7 +242,7 @@ export const EditorRoom: React.FC = () => {
         return `${baseName}_${sessionSuffix}`;
       }
     } catch {}
-    return `Developer_${Math.floor(1000 + Math.random() * 9000)}`;
+    return `Dev_${Math.floor(1000 + Math.random() * 9000)}`;
   });
 
   const currentUserRef = useRef({ name: username });
@@ -292,7 +292,7 @@ export const EditorRoom: React.FC = () => {
   const [unreadCount, setUnreadCount] = useState(0);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
 
-  // Synchronization Lock to prevent remote overwrite and cursor collision
+  // Lock flag for remote deltas
   const isRemoteUpdate = useRef(false);
 
   // References
@@ -400,7 +400,7 @@ export const EditorRoom: React.FC = () => {
     renderAllOverlayCursors();
   }, [activeFileId, renderAllOverlayCursors]);
 
-  // SOCKET CONNECTION & INITIALIZATION
+  // SOCKET INITIALIZATION
   useEffect(() => {
     const BACKEND_URL =
       import.meta.env.VITE_BACKEND_URL || 'https://synccode-backend-9s50.onrender.com';
@@ -468,39 +468,47 @@ export const EditorRoom: React.FC = () => {
       });
     });
 
-    // Cursor-preserving remote edit update
-    socket.on('file-code-update', ({ fileId, content }: { fileId: string; content: string }) => {
-      setNodes((prev) =>
-        prev.map((n) => (n.id === fileId ? { ...n, content } : n))
-      );
-
-      if (fileId === activeFileIdRef.current && editorRef.current) {
+    // Handle Incremental Line/Delta Sync (Prevents Overwriting Remote Edits)
+    socket.on('file-code-delta', ({ fileId, range, text }: {
+      fileId: string;
+      range: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number };
+      text: string;
+    }) => {
+      if (fileId === activeFileIdRef.current && editorRef.current && monacoRef.current) {
         const editor = editorRef.current;
         const model = editor.getModel();
 
-        if (model && model.getValue() !== content) {
+        if (model) {
           isRemoteUpdate.current = true;
-          const currentPosition = editor.getPosition();
 
-          editor.executeEdits('remote-sync', [
+          editor.executeEdits('remote-delta', [
             {
-              range: model.getFullModelRange(),
-              text: content,
+              range: new monacoRef.current.Range(
+                range.startLineNumber,
+                range.startColumn,
+                range.endLineNumber,
+                range.endColumn
+              ),
+              text: text,
               forceMoveMarkers: true,
             },
           ]);
 
-          editor.pushUndoStop();
-
-          if (currentPosition) {
-            editor.setPosition(currentPosition);
-          }
+          const updatedDoc = model.getValue();
+          setNodes((prev) =>
+            prev.map((n) => (n.id === fileId ? { ...n, content: updatedDoc } : n))
+          );
 
           isRemoteUpdate.current = false;
         }
       }
+    });
 
-      setTimeout(() => renderAllOverlayCursors(), 0);
+    // Fallback full file content update
+    socket.on('file-code-update', ({ fileId, content }: { fileId: string; content: string }) => {
+      setNodes((prev) =>
+        prev.map((n) => (n.id === fileId ? { ...n, content } : n))
+      );
     });
 
     socket.on('peer:active-file-changed', ({ socketId, fileId }: { socketId: string; fileId: string }) => {
@@ -577,6 +585,30 @@ export const EditorRoom: React.FC = () => {
     editorRef.current = editor;
     monacoRef.current = monaco;
 
+    // Attach granular listener to Monaco model
+    editor.onDidChangeModelContent((event) => {
+      if (isRemoteUpdate.current || isEditorLocked) return;
+
+      event.changes.forEach((change) => {
+        socketRef.current?.emit('file-code-delta', {
+          roomId,
+          fileId: activeFileIdRef.current,
+          range: {
+            startLineNumber: change.range.startLineNumber,
+            startColumn: change.range.startColumn,
+            endLineNumber: change.range.endLineNumber,
+            endColumn: change.range.endColumn,
+          },
+          text: change.text,
+        });
+      });
+
+      const currentDoc = editor.getValue();
+      setNodes((prev) =>
+        prev.map((n) => (n.id === activeFileIdRef.current ? { ...n, content: currentDoc } : n))
+      );
+    });
+
     editor.onDidChangeCursorPosition((e) => {
       if (!editor.hasTextFocus()) return;
 
@@ -594,25 +626,8 @@ export const EditorRoom: React.FC = () => {
 
     editor.onDidScrollChange(() => renderAllOverlayCursors());
     editor.onDidLayoutChange(() => renderAllOverlayCursors());
-    editor.onDidChangeModelContent(() => renderAllOverlayCursors());
 
     window.addEventListener('resize', renderAllOverlayCursors);
-  };
-
-  const handleCodeChange = (value: string | undefined) => {
-    if (isEditorLocked || isRemoteUpdate.current) return;
-
-    const updatedContent = value || '';
-
-    setNodes((prev) =>
-      prev.map((n) => (n.id === activeFileId ? { ...n, content: updatedContent } : n))
-    );
-
-    socketRef.current?.emit('file-code-change', {
-      roomId,
-      fileId: activeFileId,
-      content: updatedContent,
-    });
   };
 
   const toggleFolder = (folderId: string) => {
@@ -1176,7 +1191,6 @@ export const EditorRoom: React.FC = () => {
                 theme={theme.monacoTheme}
                 language={activeFile.language || 'python'}
                 value={activeFile.content}
-                onChange={handleCodeChange}
                 beforeMount={handleEditorWillMount}
                 onMount={handleEditorMount}
                 options={{
