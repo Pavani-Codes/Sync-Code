@@ -236,7 +236,7 @@ export const EditorRoom: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Project Name state
+  // Dynamic project name with state fallback
   const [projectName, setProjectName] = useState<string>(() => {
     return (location.state as any)?.projectName || '';
   });
@@ -764,50 +764,60 @@ export const EditorRoom: React.FC = () => {
     }
   };
 
-  // Run code using direct Piston sandbox execution with interactive STDIN input support
+  // Run code using free public Judge0 CE API with interactive STDIN input support
   const runCode = async () => {
     if (!activeFile) return;
 
     setIsRunning(true);
     setIsConsoleOpen(true);
-    setOutput(`[SyncCode]: Executing ${activeFile.name} with Piston Engine...\n`);
+    setOutput(`[SyncCode]: Compiling & running ${activeFile.name}...\n`);
 
     const doc = getYDoc(activeFile.id);
     const codeToRun = doc.getText('content').toString();
 
-    // Map extension to Piston language specifications
-    const langMap: Record<string, { language: string; version: string; file: string }> = {
-      python: { language: 'python', version: '3.10.0', file: 'main.py' },
-      java: { language: 'java', version: '15.0.2', file: 'Main.java' },
-      cpp: { language: 'c++', version: '10.2.0', file: 'main.cpp' },
+    // Judge0 language IDs: 71 = Python 3.8.1, 62 = Java (OpenJDK 13), 54 = C++ (GCC 9.2.0)
+    const judge0LanguageIds: Record<string, number> = {
+      python: 71,
+      java: 62,
+      cpp: 54,
     };
 
     const currentLang = activeFile.language || 'python';
-    const spec = langMap[currentLang] || langMap.python;
+    const languageId = judge0LanguageIds[currentLang] || 71;
 
     try {
-      const response = await fetch('https://emkc.org/api/v2/piston/execute', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          language: spec.language,
-          version: spec.version,
-          files: [{ name: spec.file, content: codeToRun }],
-          stdin: stdinInput,
-        }),
-      });
+      const response = await fetch(
+        'https://ce.judge0.com/submissions?base64_encoded=false&wait=true',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source_code: codeToRun,
+            language_id: languageId,
+            stdin: stdinInput || '',
+          }),
+        }
+      );
 
       const data = await response.json();
-      const runResult = data.run;
-      const combinedOutput =
-        (runResult?.output || '') ||
-        (data.compile?.stderr ? `Compile Error:\n${data.compile.stderr}` : '') ||
-        (data.message || 'Execution completed with no output.');
 
-      setOutput(combinedOutput);
-      socketRef.current?.emit('run-code-results', { roomId, output: combinedOutput });
+      let finalOutput = '';
+      if (data.compile_output) {
+        finalOutput = `Compile Error:\n${data.compile_output}`;
+      } else if (data.stderr) {
+        finalOutput = `Runtime Error:\n${data.stderr}`;
+      } else if (data.stdout) {
+        finalOutput = data.stdout;
+      } else if (data.status && data.status.description) {
+        finalOutput = `Status: ${data.status.description}`;
+      } else {
+        finalOutput = 'Program finished with no output.';
+      }
+
+      setOutput(finalOutput);
+      socketRef.current?.emit('run-code-results', { roomId, output: finalOutput });
     } catch (err: any) {
-      const errorMsg = `Error: Execution failed. ${err.message}`;
+      const errorMsg = `Execution Error: ${err.message}`;
       setOutput(errorMsg);
       socketRef.current?.emit('run-code-results', { roomId, output: errorMsg });
     } finally {
@@ -962,7 +972,7 @@ export const EditorRoom: React.FC = () => {
             <CodeXml className={`h-5 w-5 ${theme.accentText}`} />
           </div>
 
-          {/* Displays user's actual project name */}
+          {/* Project Name display */}
           <div className="flex flex-col">
             <span className="font-extrabold text-sm tracking-wide leading-tight">
               {projectName || `Project ${roomId}`}
